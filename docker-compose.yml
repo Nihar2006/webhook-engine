@@ -27,5 +27,39 @@ services:
       timeout: 5s
       retries: 5
 
+  # ---------------------------------------------------------------------------
+  # Phase 3: Celery worker
+  #
+  # Runs the background delivery worker.  The worker:
+  #   - Subscribes to the Redis task queue
+  #   - Executes deliver_webhook_task for each event
+  #   - Writes DeliveryAttempt rows and updates Event.status in Postgres
+  #
+  # To run the worker LOCALLY (outside Docker) on Windows:
+  #   celery -A app.core.celery_app worker --loglevel=info -P solo
+  #
+  # The -P solo flag is required on Windows because the default prefork pool
+  # uses os.fork(), which is unavailable on that platform.
+  # ---------------------------------------------------------------------------
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webhook_celery_worker
+    command: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://webhook:webhook@postgres:5432/webhookdb
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles:
+      # Only start the celery_worker when explicitly requested:
+      #   docker compose --profile celery up
+      # This keeps the default `docker compose up` lightweight (just Postgres + Redis).
+      - celery
+
 volumes:
   postgres_data:
