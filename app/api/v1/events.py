@@ -81,14 +81,27 @@ async def dispatch_event(
     event_id = str(event.id)
 
     # ------------------------------------------------------------------
-    # 2. Enqueue the Celery delivery task
-    #    .delay() is non-blocking: it pushes the task payload to Redis
-    #    and returns immediately with an AsyncResult handle.
+    # 2. Commit BEFORE enqueuing — critical for correctness.
+    #
+    #    db.flush() above wrote the row within an open transaction that is
+    #    invisible to other connections (including the Celery worker's
+    #    psycopg2 session) until committed.  If we call .delay() first,
+    #    Celery can pick up the task and query Postgres before the commit
+    #    lands, finding no row and skipping delivery entirely.
+    #
+    #    Committing here makes the row durable and visible before any
+    #    worker can start processing.  The extra round-trip is negligible
+    #    (~1 ms) and keeps end-to-end latency well under the 20 ms target.
+    # ------------------------------------------------------------------
+    await db.commit()
+
+    # ------------------------------------------------------------------
+    # 3. Enqueue the Celery delivery task (non-blocking Redis push).
     # ------------------------------------------------------------------
     deliver_webhook_task.delay(event_id)
 
     # ------------------------------------------------------------------
-    # 3. Return 202 Accepted — delivery is in progress in the background
+    # 4. Return 202 Accepted — delivery is in progress in the background
     # ------------------------------------------------------------------
     return EventAccepted(
         event_id=event.id,
