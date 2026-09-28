@@ -63,4 +63,20 @@ celery_app.conf.update(
 # The explicit include list is the correct, unambiguous approach whenever
 # tasks live in submodules (e.g. app/tasks/delivery.py) rather than a
 # conventional top-level tasks.py per Django-style app.
+# Explicitly include each task module.
+#
+# Why not autodiscover_tasks?
+# ---------------------------
+# autodiscover_tasks([\"app.tasks\"]) would search for a module named
+# app.tasks.tasks (i.e. it appends \".tasks\" to each entry).  Since our
+# module is app.tasks.delivery — not app.tasks.tasks — autodiscover silently
+# finds nothing and the worker starts with an empty task registry.
+#
+# The explicit include list is the correct, unambiguous approach whenever
+# tasks live in submodules (e.g. app/tasks/delivery.py) rather than a
+# conventional top-level tasks.py per Django-style app.
+#
+# Phase 4: app.tasks.delivery now exports two tasks:
+#   - deliver_webhook_task        (dispatcher, no retries)
+#   - deliver_to_endpoint_task    (per-endpoint worker, max_retries=4)
 celery_app.conf.include = ["app.tasks.delivery"]
