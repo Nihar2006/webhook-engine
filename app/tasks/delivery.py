@@ -1,7 +1,7 @@
 """
 app/tasks/delivery.py
 ~~~~~~~~~~~~~~~~~~~~~
-Celery tasks: dispatch and deliver webhook events — Phase 4.
+Celery tasks: dispatch and deliver webhook events — Phase 4 / Phase 5.
 
 Architecture
 ------------
@@ -43,16 +43,30 @@ The synchronous ``psycopg2`` engine is the idiomatic solution.
 
 Session lifecycle (three short sessions per attempt)
 ----------------------------------------------------
-Phase A  read  : fetch event + endpoint data, close session.
+Phase A  read  : fetch event + endpoint data (incl. idempotency_key),
+                 pre-generate delivery_attempt UUID, close session.
 Phase B  HTTP  : fire the POST with no DB connection held.
-Phase C  write : open fresh session, insert DeliveryAttempt, update
-                 Event.status if this is a terminal attempt, commit.
+                 Four structured headers are injected (Phase 5):
+                     X-Webhook-Event-Id, X-Webhook-Delivery-Id,
+                     X-Webhook-Idempotency-Key, X-Webhook-Timestamp.
+Phase C  write : open fresh session, insert DeliveryAttempt (using the
+                 pre-generated UUID from Phase A), update Event.status
+                 if this is a terminal attempt, commit.
+
+Phase 5 header semantics
+------------------------
+``X-Webhook-Event-Id`` and ``X-Webhook-Idempotency-Key`` are **stable**
+across all retry attempts for the same event — the destination server can
+use either as a deduplication key.  ``X-Webhook-Delivery-Id`` is freshly
+generated per attempt, letting subscribers distinguish individual deliveries
+in their own audit log.
 """
 from __future__ import annotations
 
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from celery import shared_task
@@ -241,9 +255,16 @@ def deliver_to_endpoint_task(  # type: ignore[override]
             )
             return {"endpoint_id": endpoint_id, "error": "Endpoint not found"}
 
-        event_payload: dict = dict(event.payload)
-        target_url: str    = str(endpoint.target_url)
+        event_payload: dict  = dict(event.payload)
+        target_url: str      = str(endpoint.target_url)
+        event_idempotency_key: str = str(event.idempotency_key)
+        event_id_str: str    = str(event.id)
     # Session closed — no DB connection held during HTTP call.
+
+    # Pre-generate the DeliveryAttempt UUID so we can embed it in the
+    # request headers *and* use the same value in the Phase C DB write.
+    delivery_attempt_id: uuid.UUID = uuid.uuid4()
+    dispatch_timestamp: str = datetime.now(tz=timezone.utc).isoformat()
 
     # ------------------------------------------------------------------
     # Phase B: HTTP delivery — classify outcome.
@@ -255,8 +276,18 @@ def deliver_to_endpoint_task(  # type: ignore[override]
 
     t0 = time.perf_counter()
     try:
+        # Structured idempotency + tracing headers injected on every attempt.
+        # The destination server can use X-Webhook-Event-Id and
+        # X-Webhook-Idempotency-Key (which are stable across retries) to
+        # deduplicate on its side.  X-Webhook-Delivery-Id changes per attempt.
+        delivery_headers = {
+            "X-Webhook-Event-Id":        event_id_str,
+            "X-Webhook-Delivery-Id":     str(delivery_attempt_id),
+            "X-Webhook-Idempotency-Key": event_idempotency_key,
+            "X-Webhook-Timestamp":       dispatch_timestamp,
+        }
         with httpx.Client(timeout=_HTTP_TIMEOUT_S) as http_client:
-            resp = http_client.post(target_url, json=event_payload)
+            resp = http_client.post(target_url, json=event_payload, headers=delivery_headers)
 
         http_status   = resp.status_code
         response_body = resp.text[:4096]
@@ -333,6 +364,7 @@ def deliver_to_endpoint_task(  # type: ignore[override]
     try:
         with Session(_sync_engine) as session:
             session.add(DeliveryAttempt(
+                id            = delivery_attempt_id,
                 event_id      = event_uuid,
                 endpoint_id   = endpoint_uuid,
                 http_status   = http_status,

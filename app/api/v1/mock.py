@@ -1,7 +1,7 @@
 """
 app/api/v1/mock.py
 ~~~~~~~~~~~~~~~~~~
-Mock webhook receivers — Phase 4 extension.
+Mock webhook receivers — Phase 4 / Phase 5 extensions.
 
 Endpoints
 ---------
@@ -11,6 +11,10 @@ POST /api/v1/mock/flaky      — fails with 503 on the first 2 calls per cycle,
                                calls so the endpoint works for repeated test runs.
 POST /api/v1/mock/failing    — always returns 500.  Used to exercise
                                max-retries-exhausted behaviour.
+POST /api/v1/mock/echo       — Phase 5: mirrors all received request headers
+                               back as a JSON body.  Used by verify_phase5.py
+                               Suite B to assert idempotency headers arrive
+                               intact at the destination server.
 
 Implementation note — flaky call counter
 -----------------------------------------
@@ -24,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter(prefix="/mock", tags=["mock"])
@@ -138,4 +142,35 @@ async def mock_failing() -> JSONResponse:
     return JSONResponse(
         status_code=500,
         content={"error": "Internal Server Error", "detail": "Simulated permanent failure"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — echo receiver: mirrors request headers as JSON (for header assert)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/echo",
+    summary="Phase 5: Echo all received request headers as JSON body",
+)
+async def mock_echo(request: Request) -> JSONResponse:
+    """
+    Returns every HTTP request header as a JSON object.
+
+    Used by ``verify_phase5.py`` Suite B to assert that the four webhook
+    delivery headers injected by ``deliver_to_endpoint_task`` arrive intact
+    at the destination server:
+
+    * ``X-Webhook-Event-Id``
+    * ``X-Webhook-Delivery-Id``
+    * ``X-Webhook-Idempotency-Key``
+    * ``X-Webhook-Timestamp``
+
+    The Celery worker stores the JSON response body in ``DeliveryAttempt.
+    response_body``, which ``verify_phase5.py`` then parses and inspects.
+    """
+    headers_dict = dict(request.headers)
+    return JSONResponse(
+        status_code=200,
+        content={"received_headers": headers_dict},
     )
