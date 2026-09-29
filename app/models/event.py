@@ -10,9 +10,10 @@ from app.models.base import Base
 
 
 class EventStatus(str, enum.Enum):
-    PENDING = "PENDING"
-    DELIVERED = "DELIVERED"
-    FAILED = "FAILED"
+    PENDING     = "PENDING"
+    DELIVERED   = "DELIVERED"
+    FAILED      = "FAILED"
+    DEAD_LETTER = "DEAD_LETTER"   # retries exhausted on transient error — needs operator replay
 
 
 class Event(Base):

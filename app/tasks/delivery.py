@@ -1,7 +1,7 @@
 """
 app/tasks/delivery.py
 ~~~~~~~~~~~~~~~~~~~~~
-Celery tasks: dispatch and deliver webhook events — Phase 4 / Phase 5.
+Celery tasks: dispatch and deliver webhook events — Phase 4 / Phase 5 / Phase 6.
 
 Architecture
 ------------
@@ -23,7 +23,8 @@ Phase 4 splits the monolithic ``deliver_webhook_task`` into two tasks:
                             help; the caller must fix the payload/config.)
    5xx / err  TRANSIENT     Record attempt, jitter-backoff retry up to
                             ``max_retries`` times.  If exhausted, mark
-                            Event FAILED.
+                            Event DEAD_LETTER (Phase 6) and emit a
+                            structured [DLQ] log line.
    =========  ============  ==============================================
 
    attempt_number = self.request.retries + 1  (1-indexed, increments per retry)
@@ -357,9 +358,14 @@ def deliver_to_endpoint_task(  # type: ignore[override]
 
     final_event_status: EventStatus | None = None
     if is_terminal:
-        final_event_status = (
-            EventStatus.DELIVERED if outcome == _SUCCESS else EventStatus.FAILED
-        )
+        if outcome == _SUCCESS:
+            final_event_status = EventStatus.DELIVERED
+        elif outcome == _CLIENT_ERROR:
+            # 4xx: non-retryable, bad payload or endpoint config.
+            final_event_status = EventStatus.FAILED
+        else:
+            # retries_exhausted on transient error — move to Dead-Letter Queue.
+            final_event_status = EventStatus.DEAD_LETTER
 
     try:
         with Session(_sync_engine) as session:
@@ -408,8 +414,9 @@ def deliver_to_endpoint_task(  # type: ignore[override]
 
     if retries_exhausted:
         logger.error(
-            "[deliver_to_endpoint_task] Max retries (%d) exhausted for event=%s endpoint=%s — FAILED",
-            self.max_retries, event_id, endpoint_id,
+            "[DLQ] event=%s endpoint=%s moved to DEAD_LETTER after %d attempt(s). "
+            "Last HTTP status: %s. Use POST /api/v1/events/%s/replay to redeliver.",
+            event_id, endpoint_id, attempt_number, http_status, event_id,
         )
 
     return {

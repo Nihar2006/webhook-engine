@@ -41,3 +41,39 @@ class EventAccepted(BaseModel):
     event_id: uuid.UUID
     status: Literal["ACCEPTED"]
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — DLQ & Replay schemas
+# ---------------------------------------------------------------------------
+
+class DLQEventItem(BaseModel):
+    """One item in the paginated DLQ list — enriched with attempt metadata."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    event_type: str
+    idempotency_key: str
+    status: EventStatus
+    created_at: datetime
+    total_attempts: int
+    last_http_status: int | None
+    last_error: str | None
+
+
+class DLQListResponse(BaseModel):
+    """Paginated response from GET /api/v1/dlq."""
+
+    total: int
+    page: int
+    page_size: int
+    items: list[DLQEventItem]
+
+
+class ReplayAccepted(BaseModel):
+    """HTTP 202 response from POST /api/v1/events/{event_id}/replay."""
+
+    event_id: uuid.UUID
+    status: Literal["REPLAY_QUEUED"]
+    message: str

@@ -1,12 +1,14 @@
 """
 app/main.py
 ~~~~~~~~~~~
-FastAPI application entry point — Phase 3.
+FastAPI application entry point — Phase 6.
 
 Routers mounted:
-  /api/v1/endpoints  — register and list webhook endpoints
-  /api/v1/events     — dispatch events (async delivery via Celery)
-  /api/v1/mock       — slow mock receiver for benchmarking
+  /api/v1/endpoints        — register and list webhook endpoints
+  /api/v1/events           — dispatch events (async delivery via Celery)
+  /api/v1/dlq              — list dead-lettered events
+  /api/v1/events/{id}/replay — manually replay a failed/DLQ event
+  /api/v1/mock             — mock receivers for testing
 """
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -19,6 +21,7 @@ from fastapi import FastAPI
 # app.tasks.delivery (imported transitively by events.py) is loaded.
 from app.core.celery_app import celery_app  # noqa: F401
 
+from app.api.v1.dlq import router as dlq_router
 from app.api.v1.endpoints import router as endpoints_router
 from app.api.v1.events import router as events_router
 from app.api.v1.mock import router as mock_router
@@ -41,11 +44,12 @@ app = FastAPI(
     title="Webhook Engine",
     description=(
         "A scalable webhook delivery system. "
-        "Phase 3: asynchronous delivery via Celery + Redis — "
-        "POST /api/v1/events returns 202 Accepted immediately; "
-        "a Celery worker handles fan-out in the background."
+        "Phase 6: Dead-Letter Queue + manual replay. "
+        "POST /api/v1/events returns 202 Accepted; "
+        "GET /api/v1/dlq lists failed events; "
+        "POST /api/v1/events/{id}/replay redelivers them."
     ),
-    version="0.3.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -54,6 +58,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.include_router(endpoints_router, prefix="/api/v1")
 app.include_router(events_router, prefix="/api/v1")
+app.include_router(dlq_router, prefix="/api/v1")
 app.include_router(mock_router, prefix="/api/v1")
 
 
