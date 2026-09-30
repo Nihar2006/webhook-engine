@@ -64,6 +64,7 @@ in their own audit log.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -76,6 +77,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.retry import calculate_full_jitter_backoff
+from app.core.security import generate_webhook_signature
 from app.models.delivery import DeliveryAttempt
 from app.models.endpoint import WebhookEndpoint
 from app.models.event import Event, EventStatus
@@ -256,16 +258,37 @@ def deliver_to_endpoint_task(  # type: ignore[override]
             )
             return {"endpoint_id": endpoint_id, "error": "Endpoint not found"}
 
-        event_payload: dict  = dict(event.payload)
-        target_url: str      = str(endpoint.target_url)
+        event_payload: dict       = dict(event.payload)
+        target_url: str            = str(endpoint.target_url)
         event_idempotency_key: str = str(event.idempotency_key)
-        event_id_str: str    = str(event.id)
-    # Session closed — no DB connection held during HTTP call.
+        event_id_str: str          = str(event.id)
+        endpoint_secret: str | None = endpoint.secret   # None = unsigned endpoint
+    # Session closed -- no DB connection held during HTTP call.
 
     # Pre-generate the DeliveryAttempt UUID so we can embed it in the
     # request headers *and* use the same value in the Phase C DB write.
     delivery_attempt_id: uuid.UUID = uuid.uuid4()
     dispatch_timestamp: str = datetime.now(tz=timezone.utc).isoformat()
+
+    # ------------------------------------------------------------------
+    # Serialise payload exactly once -- signed bytes must equal sent bytes.
+    #
+    # Using httpx's json= kwarg lets httpx re-serialise the dict internally;
+    # the resulting bytes might differ from what we signed (key ordering,
+    # spacing). Instead we serialise once with deterministic settings
+    # (sort_keys=True, compact separators) and POST raw content=.
+    # ------------------------------------------------------------------
+    unix_ts: int = int(time.time())
+    payload_str: str = json.dumps(event_payload, separators=(",", ":"), sort_keys=True)
+
+    # Build X-Webhook-Signature only when the endpoint has a secret.
+    sig_header: str | None = None
+    if endpoint_secret:
+        sig_header = generate_webhook_signature(endpoint_secret, unix_ts, payload_str)
+        logger.debug(
+            "[deliver_to_endpoint_task] Signing event=%s with HMAC-SHA256 (ts=%d)",
+            event_id, unix_ts,
+        )
 
     # ------------------------------------------------------------------
     # Phase B: HTTP delivery — classify outcome.
@@ -287,8 +310,15 @@ def deliver_to_endpoint_task(  # type: ignore[override]
             "X-Webhook-Idempotency-Key": event_idempotency_key,
             "X-Webhook-Timestamp":       dispatch_timestamp,
         }
+        if sig_header:
+            delivery_headers["X-Webhook-Signature"] = sig_header
+
         with httpx.Client(timeout=_HTTP_TIMEOUT_S) as http_client:
-            resp = http_client.post(target_url, json=event_payload, headers=delivery_headers)
+            resp = http_client.post(
+                target_url,
+                content=payload_str.encode("utf-8"),
+                headers={"Content-Type": "application/json", **delivery_headers},
+            )
 
         http_status   = resp.status_code
         response_body = resp.text[:4096]

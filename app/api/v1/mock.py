@@ -5,16 +5,18 @@ Mock webhook receivers — Phase 4 / Phase 5 extensions.
 
 Endpoints
 ---------
-POST /api/v1/mock/receiver   — slow (1.5 s) success; used in Phase 2/3 benchmarks.
-POST /api/v1/mock/flaky      — fails with 503 on the first 2 calls per cycle,
+POST /api/v1/mock/receiver   -- slow (1.5 s) success; used in Phase 2/3 benchmarks.
+POST /api/v1/mock/flaky      -- fails with 503 on the first 2 calls per cycle,
                                succeeds with 200 on the 3rd.  Cycles every 3
                                calls so the endpoint works for repeated test runs.
-POST /api/v1/mock/failing    — always returns 500.  Used to exercise
+POST /api/v1/mock/failing    -- always returns 500.  Used to exercise
                                max-retries-exhausted behaviour.
-POST /api/v1/mock/echo       — Phase 5: mirrors all received request headers
-                               back as a JSON body.  Used by verify_phase5.py
-                               Suite B to assert idempotency headers arrive
-                               intact at the destination server.
+POST /api/v1/mock/echo       -- Phase 5: mirrors all received request headers
+                               back as a JSON body.
+POST /api/v1/mock/secure     -- Phase 7: verifies X-Webhook-Signature HMAC-SHA256
+                               against a secret passed as ?secret= query param.
+                               Returns 200 (verified), 400 (timestamp expired),
+                               or 401 (invalid / missing signature).
 
 Implementation note — flaky call counter
 -----------------------------------------
@@ -27,9 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
+
+from app.core.security import verify_webhook_signature
 
 router = APIRouter(prefix="/mock", tags=["mock"])
 
@@ -173,4 +178,68 @@ async def mock_echo(request: Request) -> JSONResponse:
     return JSONResponse(
         status_code=200,
         content={"received_headers": headers_dict},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 -- secure receiver: real-time HMAC-SHA256 signature verification
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/secure",
+    summary="Phase 7: Verify X-Webhook-Signature HMAC-SHA256",
+)
+async def mock_secure(
+    request: Request,
+    secret: str = Query(..., description="Shared secret for HMAC-SHA256 verification"),
+) -> JSONResponse:
+    """
+    Verifies the X-Webhook-Signature header injected by deliver_to_endpoint_task.
+
+    The secret query-parameter is the endpoint's shared secret. By
+    embedding it in WebhookEndpoint.target_url (e.g. /api/v1/mock/secure?secret=abc),
+    the delivery worker passes it transparently without any worker-side changes.
+
+    Response codes:
+      200  Signature valid and timestamp fresh.
+      400  Timestamp > 300 s old (replay attack window exceeded).
+      401  Signature missing, malformed, or HMAC mismatch.
+    """
+    raw_body: bytes = await request.body()
+    sig_header: str = request.headers.get("X-Webhook-Signature", "")
+
+    if not sig_header:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "missing_signature", "detail": "X-Webhook-Signature header not present"},
+        )
+
+    # Check timestamp freshness separately to return 400 (not 401) on expiry.
+    t_val: int | None = None
+    try:
+        for part in sig_header.split(","):
+            part = part.strip()
+            if part.startswith("t="):
+                t_val = int(part[2:])
+                break
+    except (ValueError, AttributeError):
+        pass
+
+    if t_val is not None and abs(int(time.time()) - t_val) > 300:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "timestamp_expired"},
+        )
+
+    # Full HMAC verification (constant-time compare_digest inside).
+    # Pass tolerance=0 since freshness is already checked above.
+    if verify_webhook_signature(secret, sig_header, raw_body, tolerance=0):
+        return JSONResponse(
+            status_code=200,
+            content={"status": "verified", "detail": "Signature valid"},
+        )
+
+    return JSONResponse(
+        status_code=401,
+        content={"error": "invalid_signature", "detail": "HMAC mismatch"},
     )
