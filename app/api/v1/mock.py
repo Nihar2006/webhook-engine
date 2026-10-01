@@ -1,10 +1,13 @@
 """
 app/api/v1/mock.py
 ~~~~~~~~~~~~~~~~~~
-Mock webhook receivers — Phase 4 / Phase 5 extensions.
+Mock webhook receivers — Phase 4 / Phase 5 / Phase 8 extensions.
 
 Endpoints
 ---------
+POST /api/v1/mock/ok         -- Phase 8: always returns 200 instantly.  Zero
+                               latency; used by verify_phase8.py as a fast,
+                               reliable delivery target for rate-limit tests.
 POST /api/v1/mock/receiver   -- slow (1.5 s) success; used in Phase 2/3 benchmarks.
 POST /api/v1/mock/flaky      -- fails with 503 on the first 2 calls per cycle,
                                succeeds with 200 on the 3rd.  Cycles every 3
@@ -37,6 +40,26 @@ from fastapi.responses import JSONResponse
 from app.core.security import verify_webhook_signature
 
 router = APIRouter(prefix="/mock", tags=["mock"])
+
+# ---------------------------------------------------------------------------
+# Phase 8 — instant always-200 receiver (zero latency, for rate-limit tests)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/ok",
+    summary="Phase 8: Always returns 200 instantly (zero latency)",
+)
+async def mock_ok() -> dict:
+    """
+    Instantly returns ``{"status": "ok"}`` with HTTP 200.
+
+    Used by ``verify_phase8.py`` Suite A as the delivery target for the burst
+    blast.  Zero latency avoids any artificial delay interfering with
+    rate-limit window timing — we want to measure the throttle/deferral
+    mechanics, not receiver slowness.
+    """
+    return {"status": "ok"}
+
 
 # ---------------------------------------------------------------------------
 # Phase 2/3 slow receiver

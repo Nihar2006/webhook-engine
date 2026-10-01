@@ -1,7 +1,7 @@
 """
 app/tasks/delivery.py
 ~~~~~~~~~~~~~~~~~~~~~
-Celery tasks: dispatch and deliver webhook events — Phase 4 / Phase 5 / Phase 6.
+Celery tasks: dispatch and deliver webhook events — Phase 4 / 5 / 6 / 8.
 
 Architecture
 ------------
@@ -17,6 +17,9 @@ Phase 4 splits the monolithic ``deliver_webhook_task`` into two tasks:
    =========  ============  ==============================================
    Response   Outcome       Action
    =========  ============  ==============================================
+   THROTTLED  RATE LIMIT    Defer task via self.retry(countdown=window).
+                            No DeliveryAttempt written; does NOT count
+                            against the network-failure retry budget.
    2xx        SUCCESS       Record attempt, mark Event DELIVERED, done.
    4xx        CLIENT_ERROR  Record attempt, mark Event FAILED, no retry.
                             (Bad request / endpoint gone — retrying won't
@@ -28,6 +31,17 @@ Phase 4 splits the monolithic ``deliver_webhook_task`` into two tasks:
    =========  ============  ==============================================
 
    attempt_number = self.request.retries + 1  (1-indexed, increments per retry)
+
+Phase 8: Atomic per-endpoint rate limiting
+------------------------------------------
+Before every HTTP dispatch, the worker atomically increments a Redis counter
+for the target endpoint using a Lua script (INCR + conditional EXPIRE).  If
+the counter exceeds ``RATE_LIMIT_MAX`` within ``RATE_LIMIT_WINDOW_S`` seconds,
+the task is deferred via ``self.retry(countdown=RATE_LIMIT_WINDOW_S,
+max_retries=None)`` — an unlimited deferral that bypasses the 4-retry
+network-failure budget entirely.  No ``DeliveryAttempt`` is written for
+throttled deferrals, and the event never transitions to FAILED or DEAD_LETTER
+due to rate limiting.
 
 Why per-endpoint tasks?
 -----------------------
@@ -44,15 +58,17 @@ The synchronous ``psycopg2`` engine is the idiomatic solution.
 
 Session lifecycle (three short sessions per attempt)
 ----------------------------------------------------
-Phase A  read  : fetch event + endpoint data (incl. idempotency_key),
-                 pre-generate delivery_attempt UUID, close session.
-Phase B  HTTP  : fire the POST with no DB connection held.
-                 Four structured headers are injected (Phase 5):
-                     X-Webhook-Event-Id, X-Webhook-Delivery-Id,
-                     X-Webhook-Idempotency-Key, X-Webhook-Timestamp.
-Phase C  write : open fresh session, insert DeliveryAttempt (using the
-                 pre-generated UUID from Phase A), update Event.status
-                 if this is a terminal attempt, commit.
+Phase A   read    : fetch event + endpoint data (incl. idempotency_key),
+                    pre-generate delivery_attempt UUID, close session.
+Phase A.5 RL gate : atomically check rate limit via Redis Lua — if
+                    exceeded, defer with self.retry() and exit early.
+Phase B   HTTP    : fire the POST with no DB connection held.
+                    Four structured headers are injected (Phase 5):
+                        X-Webhook-Event-Id, X-Webhook-Delivery-Id,
+                        X-Webhook-Idempotency-Key, X-Webhook-Timestamp.
+Phase C   write   : open fresh session, insert DeliveryAttempt (using the
+                    pre-generated UUID from Phase A), update Event.status
+                    if this is a terminal attempt, commit.
 
 Phase 5 header semantics
 ------------------------
@@ -71,11 +87,13 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
+import redis as redis_lib
 from celery import shared_task
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.rate_limiter import RateLimitExceeded, RateLimiter
 from app.core.retry import calculate_full_jitter_backoff
 from app.core.security import generate_webhook_signature
 from app.models.delivery import DeliveryAttempt
@@ -107,6 +125,46 @@ _sync_engine = create_engine(
 
 # HTTP timeout for outbound delivery calls (seconds).
 _HTTP_TIMEOUT_S: float = 5.0
+
+# ---------------------------------------------------------------------------
+# Phase 8: Per-endpoint rate limiting constants
+# ---------------------------------------------------------------------------
+# Maximum number of HTTP delivery requests allowed per endpoint per window.
+# Configurable here; a future phase can promote these to per-endpoint DB fields.
+RATE_LIMIT_MAX: int = 10
+
+# Duration of the fixed rate-limit window in seconds.
+RATE_LIMIT_WINDOW_S: int = 1
+
+# ---------------------------------------------------------------------------
+# Phase 8: Module-level Redis client + RateLimiter singleton
+# ---------------------------------------------------------------------------
+# We use a dedicated redis-py client (not the Celery broker connection) so that
+# rate-limit counters are independent of task queue traffic.  The singleton is
+# created lazily on first use to avoid connection setup at import time.
+_redis_client: redis_lib.Redis | None = None  # type: ignore[type-arg]
+_rate_limiter: RateLimiter | None = None
+
+
+def _get_rate_limiter() -> RateLimiter:
+    """Return the module-level :class:`RateLimiter` singleton.
+
+    Creates the Redis client and registers the Lua script on first call.
+    Thread-safe for Celery's solo/prefork pool because each forked worker
+    process owns its own module globals.
+    """
+    global _redis_client, _rate_limiter
+    if _rate_limiter is None:
+        _redis_client = redis_lib.Redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=False,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        _rate_limiter = RateLimiter(_redis_client)
+        logger.debug("[delivery] RateLimiter singleton initialised.")
+    return _rate_limiter
+
 
 # Outcome sentinels — avoid bare strings scattered across the code.
 _SUCCESS        = "success"
@@ -264,6 +322,44 @@ def deliver_to_endpoint_task(  # type: ignore[override]
         event_id_str: str          = str(event.id)
         endpoint_secret: str | None = endpoint.secret   # None = unsigned endpoint
     # Session closed -- no DB connection held during HTTP call.
+
+    # ------------------------------------------------------------------
+    # Phase A.5: Rate-limit gate — atomic Redis Lua check.
+    #
+    # This runs AFTER the DB session is closed (no connection held) and
+    # BEFORE the HTTP call (no wasted network round-trip on throttled tasks).
+    #
+    # If throttled:
+    #   • Log [THROTTLED] at WARNING level.
+    #   • Re-enqueue via self.retry(countdown=RATE_LIMIT_WINDOW_S).
+    #   • max_retries=None: throttle deferrals never exhaust the retry budget.
+    #   • No DeliveryAttempt is written (this is a deferral, not a real attempt).
+    #   • The event stays PENDING — it will be retried after the window expires.
+    # ------------------------------------------------------------------
+    limiter = _get_rate_limiter()
+    is_limited, retry_after = limiter.is_rate_limited(
+        endpoint_id,
+        limit=RATE_LIMIT_MAX,
+        window_seconds=RATE_LIMIT_WINDOW_S,
+    )
+    if is_limited:
+        logger.warning(
+            "[THROTTLED] endpoint=%s exceeded rate limit (%d req/%ds) — "
+            "deferring task for %ds (attempt=%d)",
+            endpoint_id, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_S,
+            retry_after, attempt_number,
+        )
+        # Raise self.retry with max_retries=None so Celery treats this as an
+        # unconditional deferral — it will NOT count against self.max_retries
+        # (the network-failure budget) and will NOT mark the task as failed.
+        raise self.retry(
+            exc=RateLimitExceeded(
+                f"endpoint {endpoint_id} exceeded rate limit "
+                f"({RATE_LIMIT_MAX} req/{RATE_LIMIT_WINDOW_S}s)"
+            ),
+            countdown=retry_after,
+            max_retries=None,
+        )
 
     # Pre-generate the DeliveryAttempt UUID so we can embed it in the
     # request headers *and* use the same value in the Phase C DB write.
